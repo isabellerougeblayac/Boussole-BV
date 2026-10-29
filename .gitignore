@@ -1,0 +1,7 @@
+node_modules/
+dist/
+export-portable/
+export-github-pages/
+.bbv-export.json
+.DS_Store
+*.log
