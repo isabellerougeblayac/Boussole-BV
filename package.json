@@ -1,0 +1,20 @@
+{
+  "name": "boussole-budget-vert",
+  "version": "1.2.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc && vite build",
+    "test": "node --test tests/*.test.mjs",
+    "export:portable": "tsc && vite build --base ./ --outDir export-portable && node scripts/make-portable.cjs",
+    "export:github-pages": "npm test && npm run build && node scripts/make-github-pages.cjs",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "dependencies": {
+    "vite": "^5.4.11",
+    "typescript": "latest",
+    "xlsx": "latest"
+  },
+  "devDependencies": {}
+}
