@@ -1,6 +1,11 @@
 import './styles.css';
 import * as XLSX from 'xlsx';
 import rulesData from './data/rules.json';
+import afigeseLogo from '../logo-afigese-fond-blanc-1536x561.png';
+import { compileFilter } from './filters';
+import { appVersion, ratingColumns, criterionIdColumns, exportVersionColumn, normalize,
+  parseAmount, requiredIssues, qualificationIssues, qualificationStatus, validateHeaders, safeSheetName,
+  type Row, type RowStatus, type RatingBucket } from './spreadsheet';
 
 type Axis = { id: string; key: string; label: string };
 type Rule = {
@@ -16,20 +21,16 @@ type Rule = {
   criterionId: string;
 };
 type RulesData = { axes: Axis[]; domains: string[]; typesByDomain: Record<string, string[]>; rules: Rule[] };
-type Row = Array<string | number | boolean | null | undefined>;
-type RowStatus = 'rated' | 'unrated' | 'invalid';
 type ColumnDefinition = { id: string; label: string; kind: 'action' | 'status' | 'source' | 'bbv' | 'axis'; sourceIndex?: number; axisId?: string };
 type AnalysisRating = { label: string; className: string; color: string };
 type OperationAmount = { label: string; amount: number };
 type RatingAnalysis = AnalysisRating & { amount: number; percent: number; operations: OperationAmount[] };
 type AxisAnalysis = { axis: Axis; total: number; ratings: RatingAnalysis[] };
-type RatingBucket = 'favorable' | 'favorableCondition' | 'neutral' | 'unfavorable' | 'unrated' | 'outOfScope';
 
 const data = rulesData as RulesData;
 const app = document.querySelector<HTMLDivElement>('#app');
 const templateFileName = 'NOM_DE_COLLECTIVITE-BBV-modele.ods';
 const templateDownloadHref = `${import.meta.env.BASE_URL}${templateFileName}`;
-const appVersion = 'BBV-1.0';
 const sourceCodeUrl = 'https://github.com/isabellerougeblayac/Boussole-BV';
 
 const analysisRatings: AnalysisRating[] = [
@@ -105,16 +106,6 @@ function saveColumnChooserOpen(): void {
   }
 }
 
-const ratingColumns: Record<string, Record<RatingBucket, number>> = {
-  '01': { favorable: 13, favorableCondition: 14, neutral: 15, unfavorable: 16, unrated: 17, outOfScope: 18 },
-  '02': { favorable: 19, favorableCondition: 20, neutral: 21, unfavorable: 22, unrated: 23, outOfScope: 24 },
-  '03': { favorable: 25, favorableCondition: 26, neutral: 27, unfavorable: 28, unrated: 29, outOfScope: 30 },
-  '04': { favorable: 31, favorableCondition: 32, neutral: 33, unfavorable: 34, unrated: 35, outOfScope: 36 },
-  '05': { favorable: 37, favorableCondition: 38, neutral: 39, unfavorable: 40, unrated: 41, outOfScope: 42 },
-  '06': { favorable: 43, favorableCondition: 44, neutral: 45, unfavorable: 46, unrated: 47, outOfScope: 48 },
-};
-const criterionIdColumns: Record<string, number> = { '01': 78, '02': 79, '03': 80, '04': 81, '05': 82, '06': 83 };
-const exportVersionColumn = 84;
 
 const state = {
   domain: '',
@@ -125,6 +116,7 @@ const state = {
   rows: [] as Row[],
   columnLabels: [] as string[],
   filters: Array(11).fill('') as string[],
+  filterRegex: Array(11).fill(false) as boolean[],
   statusFilter: 'all' as 'all' | RowStatus,
   visibleColumns: loadVisibleColumns(),
   columnChooserOpen: loadColumnChooserOpen(),
@@ -133,11 +125,8 @@ const state = {
   community: '',
   status: '',
   activeTool: 'single' as 'single' | 'file' | 'help',
+  loading: false,
 };
-
-function normalize(value: unknown): string {
-  return String(value ?? '').replace(/\s+/g, ' ').trim();
-}
 
 function escapeHtml(value: unknown): string {
   return normalize(value)
@@ -191,32 +180,32 @@ function bucketLabel(bucket: string): string {
 
 function rowAxisRating(row: Row, axisId: string): string {
   const columns = ratingColumns[axisId];
+  const values = Object.values(columns).map((column) => normalize(row[column]));
+  if (values.some((value) => !['', '0', '1'].includes(value)) || values.filter((value) => value === '1').length > 1) return 'Incohérente';
   const found = Object.entries(columns).find(([, column]) => normalize(row[column]) === '1');
   return found ? bucketLabel(found[0]) : '';
 }
 
 function rowHasRating(row: Row): boolean {
-  return Boolean(normalize(row[11]) || normalize(row[12]) || data.axes.some((axis) => rowAxisRating(row, axis.id)));
+  return rowStatus(row) === 'rated';
 }
 
 function rowStatus(row: Row): RowStatus {
-  if (validateRequired(row).length) return 'invalid';
-  return rowHasRating(row) ? 'rated' : 'unrated';
+  return qualificationStatus(row);
 }
 
 function rowStatusLabel(status: RowStatus): string {
-  return status === 'rated' ? 'Cotée' : status === 'invalid' ? 'Incomplète' : 'À coter';
+  return { rated: 'Cotée', partial: 'Cotation partielle', inconsistent: 'Cotation incohérente', invalid: 'Données incomplètes', unrated: 'À coter' }[status];
 }
 
-function parseAmount(value: unknown): number {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
-  const text = normalize(value).replace(/\s/g, '').replace(/€/g, '').replace(/,/g, '.');
-  const amount = Number(text.replace(/[^\d.-]/g, ''));
-  return Number.isFinite(amount) ? amount : 0;
+function amountForRow(row: Row): number {
+  const amount = parseAmount(row[10]);
+  if (amount === null) throw new Error('Montant absent ou invalide.');
+  return amount;
 }
 
 function formatEuro(value: number): string {
-  return new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR', maximumFractionDigits: 0 }).format(value);
+  return new Intl.NumberFormat('fr-FR', { style: 'currency', currency: 'EUR', maximumFractionDigits: 2 }).format(value);
 }
 
 function formatDonutAmount(value: number): string {
@@ -233,11 +222,12 @@ function formatPercent(value: number): string {
 function selectedAnalysisRows(): Row[] {
   return [...state.selectedRows]
     .map((index) => state.rows[index])
-    .filter((row): row is Row => Boolean(row));
+    .filter((row): row is Row => Boolean(row) && parseAmount(row[10]) !== null);
 }
 
 function analysisRatingForRow(row: Row, axisId: string): string {
-  return rowAxisRating(row, axisId) || 'Non cotée';
+  const rating = rowAxisRating(row, axisId);
+  return rating === 'Incohérente' ? 'Non cotée' : rating || 'Non cotée';
 }
 
 function topOperations(rows: Row[], axisId: string, rating: string, total: number): OperationAmount[] {
@@ -245,7 +235,7 @@ function topOperations(rows: Row[], axisId: string, rating: string, total: numbe
   rows.forEach((row) => {
     if (analysisRatingForRow(row, axisId) !== rating) return;
     const operation = normalize(row[5]) || 'Opération non renseignée';
-    amounts.set(operation, (amounts.get(operation) ?? 0) + parseAmount(row[10]));
+    amounts.set(operation, (amounts.get(operation) ?? 0) + Math.abs(amountForRow(row)));
   });
 
   const sorted = [...amounts.entries()]
@@ -258,11 +248,11 @@ function topOperations(rows: Row[], axisId: string, rating: string, total: numbe
 }
 
 function buildAxisAnalysis(rows: Row[], axis: Axis): AxisAnalysis {
-  const total = rows.reduce((sum, row) => sum + parseAmount(row[10]), 0);
+  const total = rows.reduce((sum, row) => sum + Math.abs(amountForRow(row)), 0);
   const ratings = analysisRatings.map((rating) => {
     const amount = rows
       .filter((row) => analysisRatingForRow(row, axis.id) === rating.label)
-      .reduce((sum, row) => sum + parseAmount(row[10]), 0);
+      .reduce((sum, row) => sum + Math.abs(amountForRow(row)), 0);
     return {
       ...rating,
       amount,
@@ -319,7 +309,7 @@ function renderColumnCell(column: ColumnDefinition, row: Row, index: number, sta
   if (column.kind === 'action') {
     return `<td class="action-cell"><input type="checkbox" data-row="${index}" ${state.selectedRows.has(index) ? 'checked' : ''} aria-label="Sélectionner la ligne ${index + 1}" /><button type="button" class="small" data-quote-row="${index}">Coter cette ligne</button></td>`;
   }
-  if (column.kind === 'status') return `<td><span class="status-badge ${status}">${rowStatusLabel(status)}</span></td>`;
+  if (column.kind === 'status') return `<td><span class="status-badge ${status}">${rowStatusLabel(status)}</span><small class="row-issues">${escapeHtml([...validateRequired(row), ...qualificationIssues(row)].join(' · '))}</small></td>`;
   if (column.kind === 'source') return `<td>${escapeHtml(row[column.sourceIndex ?? 0])}</td>`;
   if (column.id === 'bbv-domain') return `<td>${escapeHtml(row[11])}</td>`;
   if (column.id === 'bbv-type') return `<td>${escapeHtml(row[12])}</td>`;
@@ -330,7 +320,16 @@ function renderColumnCell(column: ColumnDefinition, row: Row, index: number, sta
 function renderColumnFilterCell(column: ColumnDefinition): string {
   if (column.kind !== 'source') return '<th></th>';
   const index = column.sourceIndex ?? 0;
-  return `<th><input class="filter" data-filter="${index}" value="${escapeHtml(state.filters[index])}" aria-label="Filtrer ${escapeHtml(columnLabel(column))}" /></th>`;
+  const regexMode = state.filterRegex[index];
+  const { error } = compileFilter(state.filters[index], regexMode);
+  const label = escapeHtml(columnLabel(column));
+  return `<th>
+    <div class="filter-control">
+      <input class="filter" data-filter="${index}" value="${escapeHtmlPreserveLines(state.filters[index])}" aria-label="Filtrer ${label}${regexMode ? ' par expression régulière' : ''}" aria-invalid="${Boolean(error)}" ${error ? `aria-describedby="filter-error-${index}"` : ''} />
+      <button type="button" class="small regex-toggle ${regexMode ? 'active' : 'secondary'}" data-regex-toggle="${index}" aria-pressed="${regexMode}" aria-label="Expressions régulières pour ${label}" title="${regexMode ? 'Désactiver' : 'Activer'} les expressions régulières">.*</button>
+    </div>
+    ${error ? `<small class="filter-error" id="filter-error-${index}" role="status">${escapeHtml(error)}</small>` : ''}
+  </th>`;
 }
 
 function renderColumnChooser(): string {
@@ -392,15 +391,12 @@ function resetQualificationForm(): void {
 }
 
 function filteredRows(): Array<{ row: Row; index: number }> {
+  const filters = state.filters.map((filter, column) => compileFilter(filter, state.filterRegex[column]));
   return state.rows
     .slice(1)
     .map((row, offset) => ({ row, index: offset + 1 }))
     .filter(({ row }) => {
-      const matchesText = state.filters.every((filter, column) => {
-        const normalizedFilter = normalize(filter).toLocaleLowerCase('fr-FR');
-        if (!normalizedFilter) return true;
-        return normalize(row[column]).toLocaleLowerCase('fr-FR').includes(normalizedFilter);
-      });
+      const matchesText = filters.every((filter, column) => filter.matches(row[column]));
       const status = rowStatus(row);
       const matchesStatus = state.statusFilter === 'all' || state.statusFilter === status;
       return matchesText && matchesStatus;
@@ -408,7 +404,7 @@ function filteredRows(): Array<{ row: Row; index: number }> {
 }
 
 function hasActiveColumnFilters(): boolean {
-  return state.filters.some((filter) => Boolean(normalize(filter)));
+  return state.filters.some((filter) => Boolean(normalize(filter))) || state.filterRegex.some(Boolean);
 }
 
 function ensureWidth(row: Row, width: number): Row {
@@ -417,12 +413,7 @@ function ensureWidth(row: Row, width: number): Row {
 }
 
 function validateRequired(row: Row): string[] {
-  const missing = [];
-  if (!normalize(row[0])) missing.push(`A ${uploadedColumnLabel(0, 'Nature')}`);
-  if (!normalize(row[1])) missing.push(`B ${uploadedColumnLabel(1, 'Rubrique')}`);
-  if (!normalize(row[9])) missing.push(`J ${uploadedColumnLabel(9, 'Libellé')}`);
-  if (!normalize(row[10])) missing.push(`K ${uploadedColumnLabel(10, 'Montant')}`);
-  return missing;
+  return requiredIssues(row);
 }
 
 function applyQualification(): void {
@@ -475,40 +466,85 @@ function exportWorkbook(): void {
     setStatus('Téléversez un fichier ODS avant export.');
     return;
   }
-  const baseName = `${state.year || 'ANNEE'}-${state.community || 'NOM_DE_COLLECTIVITE'}`.replace(/[^\p{L}\p{N}_-]+/gu, '_');
-  const workbook = XLSX.utils.book_new();
-  const sheet = XLSX.utils.aoa_to_sheet(state.rows);
-  XLSX.utils.book_append_sheet(workbook, sheet, baseName);
-  state.sheetName = baseName;
-  XLSX.writeFile(workbook, `${baseName}-BBV.ods`, { bookType: 'ods' });
-  setStatus('Fichier ODS généré.');
+  try {
+    const baseName = `${state.year || 'ANNEE'}-${state.community || 'NOM_DE_COLLECTIVITE'}`.replace(/[^\p{L}\p{N}_-]+/gu, '_');
+    const workbook = XLSX.utils.book_new();
+    const original = state.workbook?.Sheets[state.sheetName];
+    const sheet: XLSX.WorkSheet = original ? structuredClone(original) : {};
+    const updated = XLSX.utils.aoa_to_sheet(state.rows);
+    for (const [address, cell] of Object.entries(updated)) {
+      if (address.startsWith('!')) continue;
+      if (sheet[address]?.v === cell.v && sheet[address]?.t === cell.t) continue;
+      sheet[address] = { ...sheet[address], ...cell };
+      delete sheet[address].f;
+      delete sheet[address].w;
+    }
+    sheet['!ref'] = updated['!ref'];
+    XLSX.utils.book_append_sheet(workbook, sheet, safeSheetName(state.year, state.community));
+    XLSX.writeFile(workbook, `${baseName}-BBV.ods`, { bookType: 'ods', cellStyles: true });
+    setStatus('Fichier ODS généré. Vérifiez son téléchargement dans votre navigateur.');
+  } catch (error) {
+    setStatus(`Export impossible : ${error instanceof Error ? error.message : String(error)}. Les données restent disponibles, vous pouvez réessayer.`);
+  }
 }
 
 async function loadSpreadsheet(file: File): Promise<void> {
-  const buffer = await file.arrayBuffer();
-  const workbook = XLSX.read(buffer, { type: 'array' });
-  if (workbook.SheetNames.length !== 1) {
-    state.workbook = null;
-    state.sheetName = '';
-    state.rows = [];
-    state.columnLabels = [];
+  if (state.loading) return;
+  state.loading = true;
+  setStatus(`Vérification de ${file.name}…`);
+  try {
+    if (!/\.ods$/i.test(file.name)) throw new Error('Sélectionnez un fichier au format ODS.');
+    const buffer = await file.arrayBuffer();
+    // SheetJS reconnaît aussi d'autres formats : vérifier le type ODS réel.
+    const archive = XLSX.CFB.read(new Uint8Array(buffer), { type: 'array' });
+    const mime = XLSX.CFB.find(archive, 'mimetype');
+    if (!mime || new TextDecoder().decode(mime.content).trim() !== 'application/vnd.oasis.opendocument.spreadsheet') {
+      throw new Error('Le contenu du fichier ne correspond pas à un classeur ODS.');
+    }
+    const workbook = XLSX.read(buffer, { type: 'array', cellStyles: true });
+    if (workbook.SheetNames.length !== 1) throw new Error(`Un seul onglet est attendu ; ${workbook.SheetNames.length} détecté(s).`);
+    const sheetName = workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json<Row>(sheet, { header: 1, defval: '', blankrows: true });
+    const issues = validateHeaders(rows[0] ?? []);
+    if (issues.length) throw new Error(`Structure incompatible : ${issues.slice(0, 5).join(' ; ')}${issues.length > 5 ? ` ; et ${issues.length - 5} autre(s) erreur(s)` : ''}. Utilisez le modèle fourni.`);
+    const invalidAmounts: number[] = [];
+    rows.slice(1).forEach((row, offset) => {
+      if (row.slice(85).some((value) => normalize(value))) throw new Error(`Ligne ${offset + 2} : données au-delà des 85 colonnes du modèle.`);
+      if (normalize(row[10]) && parseAmount(row[10]) === null) invalidAmounts.push(offset + 2);
+    });
+    if (invalidAmounts.length) throw new Error(`Montant invalide à la/aux ligne(s) ${invalidAmounts.slice(0, 10).join(', ')}${invalidAmounts.length > 10 ? '…' : ''}. Corrigez ces montants dans le tableur avant import.`);
+    // Ignore les lignes entièrement vides, mais conserve les lignes incomplètes.
+    const expenses = rows.slice(1).filter((row) => row.some((value) => normalize(value)));
+    if (!expenses.length) throw new Error('Le fichier ne contient aucune ligne de dépense.');
+    const importedRows = [rows[0], ...expenses];
+    // Les valeurs acceptées sont converties en nombres pour assurer un aller-retour cohérent.
+    importedRows.slice(1).forEach((row) => {
+      if (normalize(row[10])) row[10] = parseAmount(row[10]);
+    });
+    // Validation terminée : remplacer l'état seulement à partir d'ici.
+    state.workbook = workbook;
+    state.sheetName = sheetName;
+    // La suppression des lignes vides modifie les coordonnées du classeur source.
+    // Reconstruire dans ce cas pour ne pas conserver des cellules décalées.
+    if (expenses.length !== rows.length - 1) state.workbook = null;
+    state.rows = importedRows;
+    state.columnLabels = rows[0].map((value) => normalize(value));
     state.selectedRows.clear();
     state.filters = Array(11).fill('');
+    state.filterRegex = Array(11).fill(false);
     state.statusFilter = 'all';
-    setStatus(`Le fichier ODS doit contenir un seul onglet. Fichier refusé : ${workbook.SheetNames.length} onglet(s) détecté(s).`);
-    return;
+    resetQualificationForm();
+    parseSheetIdentity(sheetName);
+    const partial = expenses.filter((row) => rowStatus(row) === 'partial').length;
+    const inconsistent = expenses.filter((row) => rowStatus(row) === 'inconsistent').length;
+    state.status = `${expenses.length} dépense(s) chargée(s) depuis ${file.name}. ${partial} cotation(s) partielle(s), ${inconsistent} incohérente(s).`;
+  } catch (error) {
+    state.status = `Import refusé : ${error instanceof Error ? error.message : String(error)} ${state.rows.length ? 'Le fichier précédemment chargé et sa cotation sont conservés.' : 'Aucun fichier n’a été chargé.'}`;
+  } finally {
+    state.loading = false;
+    render();
   }
-  const sheetName = workbook.SheetNames[0];
-  const sheet = workbook.Sheets[sheetName];
-  state.workbook = workbook;
-  state.sheetName = sheetName;
-  state.rows = XLSX.utils.sheet_to_json<Row>(sheet, { header: 1, defval: '' });
-  state.columnLabels = state.rows[0]?.map((value) => normalize(value)) ?? [];
-  state.selectedRows.clear();
-  state.filters = Array(11).fill('');
-  state.statusFilter = 'all';
-  parseSheetIdentity(sheetName);
-  setStatus(`${state.rows.length - 1} dépense(s) chargée(s) depuis ${file.name}.`);
 }
 
 function renderCriteria(rule: Rule, ruleIndex: number, axisId: string): string {
@@ -590,11 +626,26 @@ function renderTable(): string {
   const columns = visibleTableColumns();
   return `
     ${renderColumnChooser()}
+    <div class="filter-help tooltip-wrap">
+      <button type="button" class="small tooltip-trigger" aria-describedby="regex-help">Filtres : aide sur les expressions régulières <span aria-hidden="true">ⓘ</span></button>
+      <span class="tooltip" id="regex-help" role="tooltip">Par défaut, les filtres recherchent un texte simple. Activez le bouton .* d'une colonne pour utiliser une expression régulière, sans tenir compte des majuscules/minuscules.
+
+Exemples (à saisir sans barres obliques) :
+^21 : commence par 21
+2026$ : se termine par 2026
+travaux|rénovation : contient l'un des deux mots
+^21[0-9]+$ : commence par 21, suivi uniquement de chiffres
+\\. : recherche un point littéral
+
+Les filtres de plusieurs colonnes se combinent avec un ET. Un champ vide ne filtre pas. Une expression invalide affiche une erreur et aucun résultat jusqu'à sa correction. « Vider les filtres de colonnes » efface les recherches et désactive les modes regex.</span>
+    </div>
     <div class="status-filters" aria-label="Filtrer par statut">
       ${[
         ['all', 'Toutes'],
         ['unrated', 'À coter'],
         ['rated', 'Cotées'],
+        ['partial', 'Cotations partielles'],
+        ['inconsistent', 'Cotations incohérentes'],
         ['invalid', 'Incomplètes'],
       ].map(([value, label]) => `<button type="button" class="status-filter ${state.statusFilter === value ? 'active' : 'secondary'}" data-status-filter="${value}">${label}</button>`).join('')}
       <button id="clear-column-filters" type="button" class="secondary" ${hasActiveColumnFilters() ? '' : 'disabled'}>Vider les filtres de colonnes</button>
@@ -650,7 +701,7 @@ function renderDonut(axisAnalysis: AxisAnalysis): string {
       ${slices || '<circle cx="100" cy="100" r="90" fill="#eee4f4"></circle><circle cx="100" cy="100" r="54" fill="#fffdf7"></circle>'}
       <circle cx="100" cy="100" r="54" fill="#fffdf7"></circle>
       <text x="100" y="96" class="donut-total">${escapeHtml(formatDonutAmount(axisAnalysis.total))}</text>
-      <text x="100" y="114" class="donut-caption">sélection</text>
+      <text x="100" y="114" class="donut-caption">volume absolu</text>
     </svg>
   `;
 }
@@ -679,14 +730,19 @@ function renderAnalysis(): string {
           <p class="eyebrow">Étape 2.3</p>
           <h2 id="analysis-title">Analyse</h2>
         </div>
-        <p class="muted">Sélectionnez les lignes pour afficher l'analyse.</p>
+        <p class="muted">${state.selectedRows.size ? `${state.selectedRows.size} ligne(s) sélectionnée(s) sans montant valide : aucune analyse disponible.` : "Sélectionnez les lignes pour afficher l'analyse."}</p>
       </section>
     `;
   }
 
   const ratedRows = rows.filter(rowHasRating);
-  const totalAmount = rows.reduce((sum, row) => sum + parseAmount(row[10]), 0);
-  const ratedAmount = ratedRows.reduce((sum, row) => sum + parseAmount(row[10]), 0);
+  const totalAmount = rows.reduce((sum, row) => sum + amountForRow(row), 0);
+  const ratedAmount = ratedRows.reduce((sum, row) => sum + amountForRow(row), 0);
+  const positiveAmount = rows.reduce((sum, row) => sum + Math.max(0, amountForRow(row)), 0);
+  const negativeAmount = rows.reduce((sum, row) => sum + Math.min(0, amountForRow(row)), 0);
+  const excludedCount = state.selectedRows.size - rows.length;
+  const partialCount = rows.filter((row) => rowStatus(row) === 'partial').length;
+  const inconsistentCount = rows.filter((row) => rowStatus(row) === 'inconsistent').length;
   const axesAnalysis = data.axes.map((axis) => buildAxisAnalysis(rows, axis));
   const year = normalize(state.year) || 'Année non renseignée';
   const community = normalize(state.community) || 'Collectivité non renseignée';
@@ -708,11 +764,16 @@ function renderAnalysis(): string {
         <div><span>Année</span><strong>${escapeHtml(year)}</strong></div>
         <div><span>Collectivité</span><strong>${escapeHtml(community)}</strong></div>
         <div><span>Lignes sélectionnées</span><strong>${rows.length}</strong></div>
-        <div><span>Dépenses cotées</span><strong>${ratedRows.length}</strong></div>
-        <div><span>Dépenses non cotées</span><strong>${rows.length - ratedRows.length}</strong></div>
-        <div><span>Montant sélectionné</span><strong>${escapeHtml(formatEuro(totalAmount))}</strong></div>
-        <div><span>Montant coté</span><strong>${escapeHtml(formatEuro(ratedAmount))}</strong></div>
+        <div><span>Cotations complètes</span><strong>${ratedRows.length}</strong></div>
+        <div><span>Autres lignes</span><strong>${rows.length - ratedRows.length}</strong></div>
+        <div><span>Cotations partielles</span><strong>${partialCount}</strong></div>
+        <div><span>Cotations incohérentes</span><strong>${inconsistentCount}</strong></div>
+        <div><span>Montant net sélectionné</span><strong>${escapeHtml(formatEuro(totalAmount))}</strong></div>
+        <div><span>Montant net entièrement coté</span><strong>${escapeHtml(formatEuro(ratedAmount))}</strong></div>
+        <div><span>Montants positifs</span><strong>${escapeHtml(formatEuro(positiveAmount))}</strong></div>
+        <div><span>Montants négatifs</span><strong>${escapeHtml(formatEuro(negativeAmount))}</strong></div>
       </div>
+      <p class="hint">Les graphiques et les opérations représentent les valeurs absolues des montants (positifs et négatifs), sans compensation. Les totaux nets sont affichés ci-dessus. Les axes incohérents sont regroupés dans « Non cotée ». ${excludedCount ? `${excludedCount} ligne(s) sans montant valide exclue(s) de l'analyse.` : ''}</p>
       <div class="donut-grid">
         ${axesAnalysis.map((axisAnalysis) => `
           <article class="donut-card">
@@ -748,7 +809,7 @@ function renderFiles(): string {
           <span class="tooltip" id="template-columns-help" role="tooltip">Les colonnes rouges ne doivent pas être renommées. Vous pouvez renommer les autres colonnes, mais vous ne devez supprimer aucune colonne. L'ordre et le nombre de colonnes doivent rester inchangés pour permettre la qualification et l'export du fichier.</span>
         </span>
         <label class="file-input secondary">Téléverser un fichier ODS
-          <input id="ods-upload" type="file" accept=".ods,application/vnd.oasis.opendocument.spreadsheet" />
+          <input id="ods-upload" type="file" accept=".ods,application/vnd.oasis.opendocument.spreadsheet" ${state.loading ? 'disabled' : ''} />
         </label>
       </div>
       <div class="form-grid compact">
@@ -856,7 +917,7 @@ function renderHelpPage(): string {
           <li><span>2</span><p>Remplir uniquement les lignes des colonnes bleues.</p></li>
           <li><span>3</span><p>Téléverser le fichier sur la page.</p></li>
           <li><span>4</span><p>Qualifier une ou plusieurs lignes en sélectionnant la cotation pour chaque axe, puis cliquer sur le bouton <strong>Appliquer les cotations aux lignes sélectionnées</strong>.</p></li>
-          <li><span>5</span><p>Analyser toutes les lignes ou seulement celles d'un service en faisant une sélection.</p></li>
+          <li><span>5</span><p>Analyser toutes les lignes ou seulement celles d'un service en faisant une sélection. Les filtres distinguent les cotations complètes, partielles et incohérentes. Les totaux sont nets ; les graphiques utilisent les valeurs absolues des montants pour représenter aussi les régularisations négatives.</p></li>
           <li><span>6</span><p>Imprimer l'analyse.</p></li>
           <li><span>7</span><p>Cliquer sur <strong>Télécharger le fichier coté</strong>.</p></li>
         </ol>
@@ -891,6 +952,7 @@ function renderHelpPage(): string {
           <h2 id="license-title">La licence de Boussole Budget Vert</h2>
         </div>
         <p>La licence de cette application est <a href="https://polyformproject.org/licenses/noncommercial/1.0.0" target="_blank" rel="noopener noreferrer">PolyForm Noncommercial 1.0.0</a>. Toute utilisation commerciale nécessite l'obtention préalable d'une licence commerciale distincte auprès de l'auteur.</p>
+        <p>La licence PolyForm Noncommercial n'est pas une licence libre, car elle restreint les usages commerciaux. Le code source est toutefois accessible afin de permettre à chacun de l'examiner et d'en vérifier le fonctionnement.</p>
         <h3>Qu'est-ce qu'un logiciel libre ?</h3>
         <p>Le logiciel libre a été créé au début des années 80 par Richard Stallman, un informaticien américain, qui cherchait à réparer son imprimante dont le fabricant refusait de partager le logiciel permettant de l'améliorer.</p>
         <p>Le logiciel libre respecte <strong>quatre libertés</strong> :</p>
@@ -912,8 +974,6 @@ function renderHelpPage(): string {
           <article><h3>Sécurité renforcée</h3><p>Le code source est ouvert, ce qui permet une vérification constante par la communauté.</p></article>
           <article><h3>Support communautaire</h3><p>Une large communauté d'utilisateurs et de développeurs peut offrir un support. Les administrations de la France, des Pays-Bas et de l'Allemagne collaborent déjà ensemble sur plusieurs logiciels de <a href="https://lasuite.numerique.gouv.fr/" target="_blank" rel="noopener noreferrer">La Suite Numérique</a>.</p></article>
         </div>
-        <blockquote>Dire que votre droit à la vie privée importe peu car vous n'avez rien à cacher revient à dire que votre liberté d'expression importe peu, car vous n'avez rien à dire. Car même si vous n'utilisez pas vos droits aujourd'hui, d'autres en ont besoin. Cela revient à dire : les autres ne m'intéressent pas. <cite>Edward Snowden</cite></blockquote>
-        <blockquote>La vie privée, c'est comme un préservatif : si vous n'en utilisez pas, vous mettez aussi votre partenaire en danger. <cite>Jacob Appelbaum, citation apocryphe</cite></blockquote>
       </section>
     </section>
   `;
@@ -958,7 +1018,6 @@ function render(): void {
   if (!app) return;
   app.innerHTML = `
     <header class="hero">
-      <div class="beta-ribbon" aria-label="Version de test">Version de test</div>
       <div class="header-actions">
         <button type="button" class="header-link" data-tool="help">Comment ça marche ?</button>
         <a class="header-link" href="${sourceCodeUrl}" target="_blank" rel="noopener noreferrer" aria-label="Voir le code source du projet sur GitHub">
@@ -966,11 +1025,15 @@ function render(): void {
           Code source
         </a>
       </div>
-      <div>
-        <p class="eyebrow app-version">${appVersion}</p>
+      <div class="hero-copy">
+        <p class="eyebrow app-version">Version ${appVersion}</p>
         <h1>Boussole Budget Vert</h1>
         <p>Outil d'aide à l'analyse des données budgétaires des collectivités au regard de l'impact environnemental.</p>
       </div>
+      <a class="afigese-card" href="https://afigese.fr/" target="_blank" rel="noopener noreferrer" aria-label="Outil créé par l’Afigese — visiter afigese.fr (nouvel onglet)">
+        <img src="${afigeseLogo}" alt="Afigese" width="1536" height="561" />
+        <span>Outil créé par l’Afigese</span>
+      </a>
     </header>
     <main>
       ${renderToolChooser()}
@@ -1035,7 +1098,16 @@ function bindEvents(): void {
   });
   document.querySelector<HTMLButtonElement>('#clear-column-filters')?.addEventListener('click', () => {
     state.filters = Array(11).fill('');
+    state.filterRegex = Array(11).fill(false);
     render();
+  });
+  document.querySelectorAll<HTMLButtonElement>('[data-regex-toggle]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const column = Number(button.dataset.regexToggle);
+      state.filterRegex[column] = !state.filterRegex[column];
+      render();
+      document.querySelector<HTMLButtonElement>(`[data-regex-toggle="${column}"]`)?.focus();
+    });
   });
   document.querySelectorAll<HTMLButtonElement>('[data-status-filter]').forEach((button) => {
     button.addEventListener('click', () => {

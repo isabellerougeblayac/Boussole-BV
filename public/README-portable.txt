@@ -1,4 +1,4 @@
-Boussole Budget Vert - dossier portable
+Boussole Budget Vert 1.2 - dossier portable
 
 Pour ouvrir l'application, double-cliquez sur le fichier index.html.
 
